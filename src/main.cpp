@@ -1,83 +1,130 @@
 #include <Arduino.h>
 #include <SoftwareSerial.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
-SoftwareSerial serialMaestro(10, 11); // RX, TX
+// Configuración de Comunicación y Pantalla
+SoftwareSerial serialEsclavo(10, 11); // Pines para hablar con el Esclavo
+LiquidCrystal_I2C lcd(0x27, 16, 2);   // Pantalla LCD I2C
 
-const int PIN_X = A0;
-const int PIN_Y = A1;
-const int PIN_BOTON = 2;
-const int PIN_LED_X = 3;
-const int PIN_LED_Y = 5;
+// Los 4 estados posibles del juego
+enum Estado { INACTIVO, JUGANDO, VICTORIA, DERROTA };
+Estado estadoActual = INACTIVO;
 
-unsigned long tEnvio = 0;
-unsigned long tDebounce = 0;
-unsigned long tUltimoByte = 0;
-bool estadoAntBoton = HIGH;
+// Pines y Variables del Juego
+const int PIN_LED_VERDE = 6;          // LED que se apaga durante los 60 segundos
+int tesoroX = 0, tesoroY = 0;         // Dónde está escondido el tesoro
+int jugadorX = 0, jugadorY = 0;       // Dónde está el jugador (según el joystick)
+unsigned long tiempoInicio = 0;       // Cuándo empezó la partida
+unsigned long tiempoEnCelda = 0;      // Cuenta los 2 segundos necesarios para ganar
+unsigned long ultimoMensaje = 0;      // Control para detectar si se desconectó el esclavo
+
+// Función para saber qué tan cerca estás (0=Frío, 1=Tibio, 2=Caliente, 3=Aquí)
+uint8_t calcularNivelProximidad(int distancia) {
+  if (distancia > 10) return 0; // Frío
+  if (distancia >= 5) return 1; // Tibio
+  if (distancia >= 1) return 2; // Caliente
+  return 3;                     // ¡Aquí! (distancia 0)
+}
 
 void setup() {
-  pinMode(PIN_BOTON, INPUT_PULLUP);
-  pinMode(PIN_LED_X, OUTPUT);
-  pinMode(PIN_LED_Y, OUTPUT);
-  serialMaestro.begin(9600);
-  tUltimoByte = millis();
+  pinMode(PIN_LED_VERDE, OUTPUT);
+  serialEsclavo.begin(9600);
+  randomSeed(analogRead(A3)); // Genera posiciones aleatorias distintas cada vez
+  lcd.init(); 
+  lcd.backlight();
 }
 
 void loop() {
   unsigned long ahora = millis();
 
-  // 1. Enviar coordenadas cada 50ms
-  if (ahora - tEnvio >= 50) {
-    tEnvio = ahora;
+  // 1. LEER LO QUE MANDA EL ESCLAVO (Joystick y Botón de Inicio)
+  while (serialEsclavo.available()) {
+    ultimoMensaje = ahora;
+    uint8_t dato = serialEsclavo.read();
     
-    // ADC uniforme y estabilización
-    analogRead(PIN_X);
-    uint8_t x = (analogRead(PIN_X) * 100L) / 1024;
-    analogRead(PIN_Y);
-    uint8_t y = (analogRead(PIN_Y) * 100L) / 1024;
-
-    serialMaestro.write('X'); 
-    serialMaestro.write(x);
-    serialMaestro.write('Y'); 
-    serialMaestro.write(y);
-  }
-
-  // 2. Leer botón de inicio con antirrebote
-  bool lecturaBoton = digitalRead(PIN_BOTON);
-  if (lecturaBoton == LOW && estadoAntBoton == HIGH && (ahora - tDebounce > 50)) {
-    serialMaestro.write(250); // Solicitud de inicio
-    tDebounce = ahora;
-  }
-  estadoAntBoton = lecturaBoton;
-
-  // 3. Recibir datos del Maestro
-  while (serialMaestro.available()) {
-    tUltimoByte = ahora;
-    uint8_t cmd = serialMaestro.read();
+    if (dato == 'X' && serialEsclavo.available()) jugadorX = serialEsclavo.read();
+    if (dato == 'Y' && serialEsclavo.available()) jugadorY = serialEsclavo.read();
     
-    if (cmd == 'L' && serialMaestro.available() >= 2) {
-      uint8_t nx = serialMaestro.read();
-      uint8_t ny = serialMaestro.read();
-      
-      // Aplicar PWM según nivel (0=0, 1=20, 2=80, 3=255)
-      analogWrite(PIN_LED_X, nx == 3 ? 255 : (nx == 2 ? 80 : (nx == 1 ? 20 : 0)));
-      analogWrite(PIN_LED_Y, ny == 3 ? 255 : (ny == 2 ? 80 : (ny == 1 ? 20 : 0)));
-    } 
-    else if (cmd == 252) { // VICTORIA
-      for(int i = 0; i < 10; i++) {
-        analogWrite(PIN_LED_X, 255); analogWrite(PIN_LED_Y, 255); delay(250);
-        analogWrite(PIN_LED_X, 0);   analogWrite(PIN_LED_Y, 0);   delay(250);
-      }
-    } 
-    else if (cmd == 253 || cmd == 251) { // DERROTA o INACTIVO
-      analogWrite(PIN_LED_X, 0);
-      analogWrite(PIN_LED_Y, 0);
+    // Si recibe el comando 250 (presionaron el botón) y estamos inactivos -> ¡Inicia el juego!
+    if (dato == 250 && estadoActual == INACTIVO) {
+      tesoroX = random(12, 101); // Esconde el tesoro al azar
+      tesoroY = random(12, 101);
+      tiempoInicio = ahora;
+      tiempoEnCelda = 0;
+      estadoActual = JUGANDO;
     }
   }
 
-  // 4. Timeout de enlace (2000 ms) -> Parpadeo alternado
-  if (ahora - tUltimoByte > 2000) {
-    bool parpadeo = (ahora / 500) % 2 == 0;
-    analogWrite(PIN_LED_X, parpadeo ? 255 : 0);
-    analogWrite(PIN_LED_Y, parpadeo ? 0 : 255);
+  // Si pasan más de 2 segundos sin recibir datos, se corta la comunicación
+  if (ahora - ultimoMensaje > 2000 && estadoActual == JUGANDO) {
+    estadoActual = INACTIVO;
+  }
+
+  // 2. CONTROL DEL JUEGO SEGÚN EL ESTADO ACTUAL
+  switch (estadoActual) {
+
+    case INACTIVO:
+      analogWrite(PIN_LED_VERDE, 0);
+      serialEsclavo.write(251); // Avisa al esclavo que estamos esperando
+      lcd.setCursor(0, 0); lcd.print(" BUSQUEDA TESORO");
+      lcd.setCursor(0, 1); lcd.print("Presione Inicio ");
+      break;
+
+    case JUGANDO: {
+      unsigned long tiempoTranscurrido = ahora - tiempoInicio;
+      
+      // Si pasan 60 segundos (60000 ms) -> Perdiste
+      if (tiempoTranscurrido >= 60000) {
+        estadoActual = DERROTA;
+        break;
+      }
+
+      // El LED verde se va apagando poco a poco (de 255 a 0)
+      int brilloLED = map(60000 - tiempoTranscurrido, 0, 60000, 0, 255);
+      analogWrite(PIN_LED_VERDE, brilloLED);
+
+      // Calcular distancia al tesoro
+      int distanciaX = abs(jugadorX - tesoroX);
+      int distanciaY = abs(jugadorY - tesoroY);
+
+      // Enviar las pistas de proximidad al esclavo para que encienda sus LEDs
+      serialEsclavo.write('L');
+      serialEsclavo.write(calcularNivelProximidad(distanciaX));
+      serialEsclavo.write(calcularNivelProximidad(distanciaY));
+
+      // CONDICIÓN DE VICTORIA: Estar en la zona del tesoro por 2 segundos seguidos
+      if ((jugadorX == tesoroX || jugadorX == tesoroX - 1) && 
+          (jugadorY == tesoroY || jugadorY == tesoroY - 1)) {
+        if (tiempoEnCelda == 0) tiempoEnCelda = ahora;
+        if (ahora - tiempoEnCelda >= 2000) estadoActual = VICTORIA;
+      } else {
+        tiempoEnCelda = 0; // Si te sales, se reinicia el contador
+      }
+
+      // Mostrar en la pantalla LCD las coordenadas y los segundos que quedan
+      int segundosRestantes = (60000 - tiempoTranscurrido) / 1000;
+      lcd.setCursor(0, 0); lcd.print("X:" + String(jugadorX) + " Y:" + String(jugadorY) + "     ");
+      lcd.setCursor(0, 1); lcd.print("T:" + String(segundosRestantes) + "s JUGANDO   ");
+      break;
+    }
+
+    case VICTORIA:
+      analogWrite(PIN_LED_VERDE, 255);
+      serialEsclavo.write(252); // Avisa victoria al esclavo
+      lcd.setCursor(0, 0); lcd.print("  ¡GANASTE! :)  ");
+      lcd.setCursor(0, 1); lcd.print("                ");
+      delay(2500);
+      estadoActual = INACTIVO;
+      break;
+
+    case DERROTA:
+      analogWrite(PIN_LED_VERDE, 0);
+      serialEsclavo.write(253); // Avisa derrota al esclavo
+      lcd.setCursor(0, 0); lcd.print("  TIEMPO AGOTADO");
+      lcd.setCursor(0, 1); lcd.print("    DERROTA :(  ");
+      delay(2500);
+      estadoActual = INACTIVO;
+      break;
   }
 }
